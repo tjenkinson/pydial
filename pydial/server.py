@@ -5,6 +5,7 @@ import time
 import platform
 import random
 import uuid
+import threading
 
 from .common import (SSDP_PORT, SSDP_ADDR, SSDP_ST)
 
@@ -12,19 +13,39 @@ UPNP_SEARCH = 'M-SEARCH * HTTP/1.1'
 # If we get a M-SEARCH with no or invalid MX value, wait up
 # to this many seconds before responding to prevent flooding
 CACHE_DEFAULT = 1800
-DELAY_DEFAULT = 10
+BACKOFF_DEFAULT = 10
 PRODUCT = 'PyDial Server'
 VERSION = '0.01'
 
 SSDP_REPLY = 'HTTP/1.1 200 OK\r\n' + \
-               'LOCATION: {}\r\n' + \
-               'CACHE-CONTROL: max-age={}\r\n' + \
+               'LOCATION: {ddd_url}\r\n' + \
+               'CACHE-CONTROL: max-age={max_age}\r\n' + \
                'EXT:\r\n' + \
                'BOOTID.UPNP.ORG: 1\r\n' + \
-               'SERVER: {}/{} UPnP/1.1 {}/{}\r\n' + \
+               'SERVER: {os_name}/{os_version} UPnP/1.1 {product_name}/{product_version}\r\n' + \
                'ST: {}\r\n'.format(SSDP_ST) + \
-               'DATE: {}\r\n' + \
-               'USN: {}\r\n' + '\r\n'
+               'DATE: {date}\r\n' + \
+               'USN: {usn}\r\n' + '\r\n'
+
+SSDP_ANNOUNCE = 'NOTIFY * HTTP/1.1\r\n' + \
+               'HOST: {}:{}\r\n'.format(SSDP_ADDR,SSDP_PORT) + \
+               'LOCATION: {ddd_url}\r\n' + \
+               'CACHE-CONTROL: max-age={max_age}\r\n' + \
+               'NT: {nt}\r\n' + \
+               'NTS: ssdp:alive\r\n' + \
+               'EXT:\r\n' + \
+               'BOOTID.UPNP.ORG: 1\r\n' + \
+               'SERVER: {os_name}/{os_version} UPnP/1.1 {product_name}/{product_version}\r\n' + \
+               'USN: {usn}\r\n' + \
+               'CONFIGID.UPNP.ORG: 1\r\n' + '\r\n'
+
+SSDP_BYEBYE = 'NOTIFY * HTTP/1.1\r\n' + \
+               'HOST: {}:{}\r\n'.format(SSDP_ADDR,SSDP_PORT) + \
+               'NT: {nt}\r\n' + \
+               'NTS: ssdp:byebye\r\n' + \
+               'BOOTID.UPNP.ORG: 1\r\n' + \
+               'USN: {usn}\r\n' + \
+               'CONFIGID.UPNP.ORG: 1\r\n' + '\r\n'
 
 
 class SSDPHandler(SocketServer.BaseRequestHandler):
@@ -39,7 +60,7 @@ class SSDPHandler(SocketServer.BaseRequestHandler):
      def __init__(self, request, client_address, server):
           SocketServer.BaseRequestHandler.__init__(self, request, 
                          client_address, server)
-          self.max_delay = DELAY_DEFAULT
+          self.max_backoff = BACKOFF_DEFAULT
 
      def handle(self):
           """
@@ -58,7 +79,7 @@ class SSDPHandler(SocketServer.BaseRequestHandler):
                          dial_search = True
                     elif field.strip() == 'MX':
                          try:
-                              self.max_delay = int(val.strip())
+                              self.max_backoff = int(val.strip())
                          except ValueError:
                               # Use default
                               pass
@@ -67,14 +88,11 @@ class SSDPHandler(SocketServer.BaseRequestHandler):
 
      def _send_reply(self):
           """Sends reply to SSDP search messages."""
-          time.sleep(random.randint(0, self.max_delay))
+          time.sleep(random.randint(0, self.max_backoff))
           _socket = self.request[1]
           timestamp = time.strftime("%A, %d %B %Y %H:%M:%S GMT", 
                     time.gmtime())
-          reply_data = SSDP_REPLY.format(self.server.device_url,
-                    self.server.cache_expire, self.server.os_id,
-                    self.server.os_version, self.server.product_id,
-                    self.server.product_version, timestamp, "uuid:"+str(self.server.uuid))
+          reply_data = SSDP_REPLY.format(date=timestamp, **self.server.fields)
 
           sent = 0
           while sent < len(reply_data):
@@ -113,16 +131,76 @@ class SSDPServer(SocketServer.UDPServer):
                                        socket.INADDR_ANY)
           self.socket.setsockopt(socket.IPPROTO_IP, 
                     socket.IP_ADD_MEMBERSHIP, mreq)
-          self.device_url = device_url
-          self.product_id = PRODUCT
-          self.product_version = VERSION
-          self.os_id = platform.system()
-          self.os_version = platform.release()
-          self.cache_expire = CACHE_DEFAULT
-          self.uuid = uuid.uuid1()
+          self.socket.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+          self.fields = {
+              "ddd_url"         : device_url,
+              "product_name"    : PRODUCT,
+              "product_version" : VERSION,
+              "os_name"         : platform.system(),
+              "os_version"      : platform.release(),
+              "max_age"         : CACHE_DEFAULT,
+              "usn"             : "uuid:"+str(uuid.uuid1()),
+          }
+          self.announcer = None
 
      def start(self):
-          self.serve_forever()
+         if not self.announcer:
+              self.announcer = SSDPAnnouncerThread(self)
+              self.announcer.start()
+
+              self.serve_forever()          
+          
+     def stop(self):
+         # stop the timer thread
+         if self.announcer:
+             self.announcer.stop()
+             self.announcer = None
+
+
+class SSDPAnnouncerThread(threading.Thread):
+    
+    UDID=object() # put this in the advertisments list to indicate that this entry should be the device UDID
+    
+    def __init__(self, server, repeats=3, minSpacing=0.1, advertisments=["upnp:rootdevice", UDID]):
+        super(SSDPAnnouncerThread,self).__init__()
+        self.daemon=True
+        self.stopping = threading.Event()
+        self.stopping.clear()
+        self.server = server
+        self.repeats = repeats
+        self.minSpacing = minSpacing
+        self.advertisments = advertisments
+        
+    def run(self):
+        while not self.stopping.is_set():
+            self._sendAll(SSDP_ANNOUNCE,"Announce")
+            self.stopping.wait(float(self.server.fields["max_age"]) * 0.75) # scale down slightly
+        self._sendAll(SSDP_BYEBYE,"Byebye")
+        
+    def stop(self):
+        if self.isAlive():
+            self.stopping.set()
+            print "waiting for announcer thread to stop"
+            self.join()
+            print "announcer thread stopped"
+            self.stopping.clear()
+            
+    def _sendAll(self, template,mode):
+        for i in range(0,self.repeats):
+            for advertisment in self.advertisments:
+                self._sendOne(template, advertisment,mode)
+                time.sleep(self.minSpacing)
+    
+    def _sendOne(self, template, advertisment,mode):
+        fields = self.server.fields.copy()
+        if advertisment == SSDPAnnouncerThread.UDID:
+            fields["nt"] = fields["usn"]
+        else:
+            fields["nt"] = advertisment
+            fields["usn"] = fields["usn"] + "::" + advertisment
+        msg = template.format(**fields)
+        self.server.socket.sendto(msg, (SSDP_ADDR, SSDP_PORT))
+        print "Broadcasted: "+mode+" ... "+fields["nt"]
 
 class DialServer(object):
      def __init__(self):
