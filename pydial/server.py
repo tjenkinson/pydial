@@ -7,7 +7,7 @@ import random
 import uuid
 import threading
 
-from .common import (SSDP_PORT, SSDP_ADDR, SSDP_ST)
+from .common import (SSDP_PORT, SSDP_ADDR, SSDP_NT)
 
 UPNP_SEARCH = 'M-SEARCH * HTTP/1.1'
 # If we get a M-SEARCH with no or invalid MX value, wait up
@@ -23,7 +23,7 @@ SSDP_REPLY = 'HTTP/1.1 200 OK\r\n' + \
                'EXT:\r\n' + \
                'BOOTID.UPNP.ORG: 1\r\n' + \
                'SERVER: {os_name}/{os_version} UPnP/1.1 {product_name}/{product_version}\r\n' + \
-               'ST: {}\r\n'.format(SSDP_ST) + \
+               'ST: {}\r\n'.format(SSDP_NT) + \
                'DATE: {date}\r\n' + \
                'USN: {usn}\r\n' + '\r\n'
 
@@ -75,7 +75,7 @@ class SSDPHandler(SocketServer.BaseRequestHandler):
                dial_search = False
                for line in data[1:]:
                     field, val = line.split(':', 1)
-                    if field.strip() == 'ST' and val.strip() == SSDP_ST:
+                    if field.strip() == 'ST' and val.strip() == SSDP_NT:
                          dial_search = True
                     elif field.strip() == 'MX':
                          try:
@@ -159,9 +159,7 @@ class SSDPServer(SocketServer.UDPServer):
 
 class SSDPAnnouncerThread(threading.Thread):
     
-    UDID=object() # put this in the advertisments list to indicate that this entry should be the device UDID
-    
-    def __init__(self, server, repeats=3, minSpacing=0.1, advertisments=["upnp:rootdevice", UDID]):
+    def __init__(self, server, repeats=3, minSpacing=0.1, advertisments=["upnp:rootdevice", SSDP_NT]):
         super(SSDPAnnouncerThread,self).__init__()
         self.daemon=True
         self.stopping = threading.Event()
@@ -191,13 +189,10 @@ class SSDPAnnouncerThread(threading.Thread):
                 self._sendOne(template, advertisment,mode)
                 time.sleep(self.minSpacing)
     
-    def _sendOne(self, template, advertisment,mode):
+    def _sendOne(self, template, advertisment, mode):
         fields = self.server.fields.copy()
-        if advertisment == SSDPAnnouncerThread.UDID:
-            fields["nt"] = fields["usn"]
-        else:
-            fields["nt"] = advertisment
-            fields["usn"] = fields["usn"] + "::" + advertisment
+        fields["nt"] = advertisment
+        fields["usn"] = fields["usn"] + "::" + advertisment
         msg = template.format(**fields)
         self.server.socket.sendto(msg, (SSDP_ADDR, SSDP_PORT))
         print "Broadcasted: "+mode+" ... "+fields["nt"]

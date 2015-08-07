@@ -6,5 +6,5 @@ SSDP_PORT = 1900
 # many seconds before replying to prevent flooding
 SSDP_MX = 3
 
-# The DIAL search target specified by the protocol
-SSDP_ST = "urn:dial-multiscreen-org:service:dial:1"
+# The DIAL notification type specified by the protocol
+SSDP_NT = "urn:dial-multiscreen-org:service:dial:1"
